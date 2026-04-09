@@ -5,6 +5,7 @@ import typer
 import boto3
 import magic
 import os
+import json
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
@@ -56,12 +57,12 @@ def upload(
         raise typer.Exit(code=1)
 
     s3 = get_s3_client()
-    
+
     mime = magic.Magic(mime=True)
     content_type = mime.from_file(file_path)
     file_type = content_type.split('/')[0]
     file_name = os.path.basename(file_path)
-    
+
     s3_key = f"{file_type}/{file_name}"
 
     typer.echo(f"File type determined as: [bold]{file_type}[/bold]")
@@ -124,20 +125,20 @@ def restore_previous(
         if len(versions) < 2:
             typer.secho("Error: At least two versions are required to restore.", fg=typer.colors.RED)
             raise typer.Exit(code=1)
-        
+
         # The API returns versions sorted by LastModified date, latest first.
         previous_version = versions[1]
         version_id_to_restore = previous_version['VersionId']
-        
+
         typer.echo(f"Restoring version [bold]{version_id_to_restore}[/bold]...")
-        
+
         s3.copy_object(
             Bucket=bucket,
             CopySource={'Bucket': bucket, 'Key': object_key, 'VersionId': version_id_to_restore},
             Key=object_key
         )
         typer.secho("Successfully restored previous version.", fg=typer.colors.GREEN)
-        
+
     except ClientError as e:
         typer.secho(f"An error occurred during restore: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
@@ -151,9 +152,9 @@ def clean(
     """Deletes object versions older than a specified number of months."""
     s3 = get_s3_client()
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=months_old * 30)
-    
+
     typer.echo(f"Searching for versions older than {cutoff_date.strftime('%Y-%m-%d')}...")
-    
+
     versions_to_delete = []
     for key in object_keys:
         try:
@@ -164,13 +165,13 @@ def clean(
         except ClientError as e:
             typer.secho(f"Could not process '{key}': {e}", fg=typer.colors.RED)
             continue
-            
+
     if not versions_to_delete:
         typer.secho("No old versions found to delete.", fg=typer.colors.GREEN)
         return
-        
+
     typer.echo(f"Found {len(versions_to_delete)} old versions to delete. Proceeding...")
-    
+
     try:
         response = s3.delete_objects(
             Bucket=bucket,
@@ -178,7 +179,7 @@ def clean(
         )
         deleted = response.get('Deleted', [])
         errors = response.get('Errors', [])
-        
+
         if deleted:
             typer.secho(f"Successfully deleted {len(deleted)} versions.", fg=typer.colors.GREEN)
         if errors:
@@ -188,6 +189,107 @@ def clean(
 
     except ClientError as e:
         typer.secho(f"An error occurred during deletion: {e}", fg=typer.colors.RED)
+
+@app.command(name="host-static-site")
+def host_static_site(
+    file_path: str = typer.Argument(..., help="The path to the local file to host (e.g., index.html)."),
+    bucket: str = typer.Option(..., "--bucket", "-b", help="The S3 bucket name.")
+):
+    """
+    Uploads a file and configures the S3 bucket for static website hosting.
+    """
+    if not os.path.exists(file_path):
+        typer.secho(f"Error: File not found at path: {file_path}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    s3 = get_s3_client()
+    file_name = os.path.basename(file_path)
+
+    # 1. Upload the file
+    typer.echo(f"Uploading [cyan]{file_path}[/cyan] to [yellow]s3://{bucket}/{file_name}[/yellow]...")
+    try:
+        s3.upload_file(file_path, bucket, file_name, ExtraArgs={'ContentType': 'text/html'})
+        typer.secho("Upload successful!", fg=typer.colors.GREEN)
+    except ClientError as e:
+        typer.secho(f"Error during upload: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    # 2. Configure bucket for static website hosting
+    typer.echo(f"Configuring bucket [yellow]{bucket}[/yellow] for static website hosting...")
+    try:
+        website_configuration = {
+            'ErrorDocument': {'Key': file_name},
+            'IndexDocument': {'Suffix': file_name},
+        }
+        s3.put_bucket_website(Bucket=bucket, WebsiteConfiguration=website_configuration)
+        typer.secho("Bucket configured successfully!", fg=typer.colors.GREEN)
+    except ClientError as e:
+        typer.secho(f"Error configuring bucket website: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+        
+    # 3. Set a public read bucket policy
+    typer.echo(f"Setting public read policy on bucket [yellow]{bucket}[/yellow]...")
+    try:
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "PublicReadGetObject",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": f"arn:aws:s3:::{bucket}/*"
+                }
+            ]
+        }
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(policy))
+        typer.secho("Bucket policy set successfully!", fg=typer.colors.GREEN)
+    except ClientError as e:
+        typer.secho(f"Error setting bucket policy: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+
+    # 4. Display the public URL
+    try:
+        location = s3.get_bucket_location(Bucket=bucket)['LocationConstraint']
+        # For us-east-1, the location constraint is None.
+        if location is None:
+            region = 'us-east-1'
+            website_url = f"http://{bucket}.s3-website-{region}.amazonaws.com"
+        else:
+            website_url = f"http://{bucket}.s3-website.{location}.amazonaws.com"
+        
+        typer.echo("\n" + "="*40)
+        typer.secho("  Static Website URL:", fg=typer.colors.CYAN, bold=True)
+        typer.echo(f"  [link={website_url}]{website_url}[/link]")
+        typer.echo("="*40 + "\n")
+
+    except ClientError as e:
+        typer.secho(f"Could not determine bucket location: {e}", fg=typer.colors.RED)
+
+@app.command(name="allow-public-access")
+def allow_public_access(
+    bucket: str = typer.Option(..., "--bucket", "-b", help="The S3 bucket name.")
+):
+    """
+    Disables the public access block for a given S3 bucket.
+    """
+    s3 = get_s3_client()
+    typer.echo(f"Disabling public access block for bucket [yellow]{bucket}[/yellow]...")
+    try:
+        s3.put_public_access_block(
+            Bucket=bucket,
+            PublicAccessBlockConfiguration={
+                'BlockPublicAcls': False,
+                'IgnorePublicAcls': False,
+                'BlockPublicPolicy': False,
+                'RestrictPublicBuckets': False
+            },
+        )
+        typer.secho("Public access block disabled successfully!", fg=typer.colors.GREEN)
+    except ClientError as e:
+        typer.secho(f"Error disabling public access block: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
 
 if __name__ == "__main__":
     app()
